@@ -16,13 +16,10 @@ For those who need to block unwanted IPv4 and IPv6 target ranges by countries at
 - [ ] Debian/Ubuntu
 - [ ] RHEL/CentOS
 
-## Contribute
-
-All suggestions, feedback, or bug reports are welcome. Feel free to submit a PR. 
 
 ## Disclaimer
 
-Use this script at your own risk! The author assumes no responsibility for any damages of any kind. It is strongly recommended you test this out on a test server before implemeting on production servers.
+Use this script at your own risk! AWe author assumes no responsibility for any damages of any kind. It is strongly recommended you test this out on a test server before implemeting on production servers.
 
 ## **Known issues:**
 
