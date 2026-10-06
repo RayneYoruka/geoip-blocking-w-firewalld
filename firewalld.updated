@@ -1,783 +1,1095 @@
 #!/bin/bash
 
-# ============================================================================
-# Firewall GeoIP + ASN blocking script for firewalld
+# ===========================================================================
+# GeoIP + Bad ASN Firewalld Blocker
 #
-# GeoIP source:
-#   https://www.ipdeny.com/
+# Downloads country CIDRs from IPdeny and bad ASN information from
+# bad-asn-list, expands the ASNs with bgpq4, normalizes the resulting
+# networks, and installs them into Firewalld hash:net ipsets.
 #
-# ASN source:
-#   https://github.com/bountyyfi/bad-asn-list
-#
-# ASN -> network conversion:
-#   bgpq4 / IRR routing data
-#
-# The script creates separate IPv4/IPv6 ipsets for:
-#
-#   geoip-blacklist-ip4
-#   geoip-blacklist-ip6
-#   asn-blacklist-ip4
-#   asn-blacklist-ip6
-#
-# All four are attached to the firewalld "drop" zone.
-# ============================================================================
+# New lists are built into temporary "-new" ipsets first.
+# Existing working ipsets are not removed until the new lists are ready.
+# ===========================================================================
 
-set -o pipefail
+set -euo pipefail
 
-# ============================================================================
+
+# ===========================================================================
 # Configuration
-# ============================================================================
+# ===========================================================================
 
 # Countries to block.
-# Change this to your own list if required.
-ZONES="ru by"
+ZONES="ch cn cl uy"
 
-# GeoIP ipset names.
-GEOIP_BLACKLIST_IP4="geoip-blacklist-ip4"
-GEOIP_BLACKLIST_IP6="geoip-blacklist-ip6"
+# Working directory.
+BASE_DIR="/var/lib/firewalld-geoip"
 
-# ASN ipset names.
-ASN_BLACKLIST_IP4="asn-blacklist-ip4"
-ASN_BLACKLIST_IP6="asn-blacklist-ip6"
+# IPdeny aggregated country list.
+IPDENY_BASE="https://www.ipdeny.com/ipblocks/data/aggregated"
 
 # Bad ASN list.
 ASN_LIST_URL="https://raw.githubusercontent.com/bountyyfi/bad-asn-list/refs/heads/main/all.txt"
 
-# Temporary working directory.
-TMPDIR="/tmp/geoip-blocking"
+# Firewalld zone used for blocking.
+BLOCK_ZONE="drop"
 
-# Maximum entries for hash:net ipsets.
-MAXELEM="200000"
+# Number of ASNs is small enough to fit comfortably in argv.
+# bgpq4 accepts multiple objects and merges them.
+#
+# This is deliberately NOT used to spawn one bgpq4 process per ASN.
+BGPQ4_BATCH_SIZE=500
 
-# Hash size.
-HASHSIZE="4096"
 
-# ============================================================================
-# Colors
-# ============================================================================
+# ===========================================================================
+# Files
+# ===========================================================================
 
-RED='\033[0;91m'
-GREEN='\033[0;92m'
-CYAN='\033[0;96m'
-YELLOW='\033[0;93m'
-PURPLE='\033[0;95m'
-BLUE='\033[0;94m'
-BOLD='\033[1m'
-NC='\033[0m'
+COUNTRY_IP4="${BASE_DIR}/country-ipv4.txt"
 
-# ============================================================================
-# Helpers
-# ============================================================================
+ASN_RAW="${BASE_DIR}/bad-asn.txt"
+ASN_CLEAN="${BASE_DIR}/bad-asn.clean"
 
-log_info() {
-    echo -e "[${PURPLE}i${NC}] $1"
+ASN_IP4_RAW="${BASE_DIR}/asn-ipv4.raw"
+ASN_IP6_RAW="${BASE_DIR}/asn-ipv6.raw"
+
+ASN_IP4_FILE="${BASE_DIR}/asn-ipv4.txt"
+ASN_IP6_FILE="${BASE_DIR}/asn-ipv6.txt"
+
+
+# ===========================================================================
+# Stable Firewalld ipsets
+# ===========================================================================
+
+GEOIP_IP4="geoip-blacklist-ip4"
+GEOIP_IP6="geoip-blacklist-ip6"
+
+ASN_IP4="asn-blacklist-ip4"
+ASN_IP6="asn-blacklist-ip6"
+
+
+# ===========================================================================
+# Staged Firewalld ipsets
+# ===========================================================================
+
+NEW_GEOIP_IP4="${GEOIP_IP4}-new"
+NEW_GEOIP_IP6="${GEOIP_IP6}-new"
+
+NEW_ASN_IP4="${ASN_IP4}-new"
+NEW_ASN_IP6="${ASN_IP6}-new"
+
+
+# ===========================================================================
+# Output helpers
+# ===========================================================================
+
+info()
+{
+    echo "[i] $*"
 }
 
-log_ok() {
-    echo -e "[${GREEN}✓${NC}] $1"
+ok()
+{
+    echo "[✓] $*"
 }
 
-log_warn() {
-    echo -e "[${YELLOW}!${NC}] $1"
+warn()
+{
+    echo "[!] $*" >&2
 }
 
-log_error() {
-    echo -e "[${RED}✗${NC}] $1"
-}
-
-abort() {
-    log_error "$1"
+fail()
+{
+    echo "[✗] $*" >&2
     exit 1
 }
 
-cleanup() {
-    rm -rf "$TMPDIR"
-}
 
-trap cleanup EXIT
+# ===========================================================================
+# Basic checks
+# ===========================================================================
 
-# ============================================================================
-# Root check
-# ============================================================================
+[[ "${EUID}" -eq 0 ]] \
+    || fail "This script must be run as root."
 
-if [[ $EUID -ne 0 ]]; then
-    abort "This script must be run as root."
-fi
+command -v firewall-cmd >/dev/null 2>&1 \
+    || fail "firewall-cmd was not found."
 
-# ============================================================================
-# Detect operating system
-# ============================================================================
+command -v curl >/dev/null 2>&1 \
+    || fail "curl was not found."
 
-APT="$(command -v apt 2>/dev/null || true)"
-DNF="$(command -v dnf 2>/dev/null || true)"
-YUM="$(command -v yum 2>/dev/null || true)"
+command -v python3 >/dev/null 2>&1 \
+    || fail "python3 was not found."
 
-if [[ -n "$APT" ]]; then
-    OS="DEBIAN"
+command -v bgpq4 >/dev/null 2>&1 \
+    || fail "bgpq4 was not found."
 
-    log_info "Detected Debian/Ubuntu"
+mkdir -p "${BASE_DIR}"
 
-elif [[ -n "$DNF" || -n "$YUM" ]]; then
-    OS="RHEL"
 
-    log_info "Detected RHEL/Fedora"
+# ===========================================================================
+# Display configuration
+# ===========================================================================
 
-else
-    abort "Couldn't determine the current operating system."
-fi
+info "Configuration:"
+echo "      Countries : ${ZONES}"
+echo "      Zone      : ${BLOCK_ZONE}"
+echo "      Work dir  : ${BASE_DIR}"
 
-# ============================================================================
-# Install/check dependencies
-# ============================================================================
+echo
+echo "      GeoIP IPv4 : ${GEOIP_IP4}"
+echo "      GeoIP IPv6 : ${GEOIP_IP6}"
+echo "      ASN IPv4   : ${ASN_IP4}"
+echo "      ASN IPv6   : ${ASN_IP6}"
 
-install_package() {
-    local package="$1"
+echo
+echo "      Staged:"
+echo "      ${NEW_GEOIP_IP4}"
+echo "      ${NEW_GEOIP_IP6}"
+echo "      ${NEW_ASN_IP4}"
+echo "      ${NEW_ASN_IP6}"
 
-    if [[ "$OS" == "DEBIAN" ]]; then
 
-        log_info "Installing ${package}"
-        apt-get update -qq
-        apt-get install -y "$package"
+# ===========================================================================
+# Clean stale staged ipsets
+#
+# This MUST happen before attempting to create the staged sets.
+#
+# These sets are created with --permanent, therefore cleanup also uses
+# --permanent.
+# ===========================================================================
 
-    else
+info "Cleaning stale staged ipsets..."
 
-        if [[ -n "$DNF" ]]; then
-            log_info "Installing ${package}"
-            dnf install -y "$package"
-        else
-            log_info "Installing ${package}"
-            yum install -y "$package"
+for set in \
+    "${NEW_GEOIP_IP4}" \
+    "${NEW_GEOIP_IP6}" \
+    "${NEW_ASN_IP4}" \
+    "${NEW_ASN_IP6}"
+do
+    if firewall-cmd --permanent --get-ipsets \
+        | grep -Fxq "${set}"
+    then
+        info "Removing stale staged ipset ${set}..."
+
+        firewall-cmd --permanent \
+            --delete-ipset="${set}" \
+            || fail "Failed to remove stale staged ipset ${set}."
+
+        if firewall-cmd --permanent --get-ipsets \
+            | grep -Fxq "${set}"
+        then
+            fail "Staged ipset ${set} still exists after deletion."
         fi
 
+        ok "Removed stale staged ipset ${set}."
     fi
-}
-
-# ----------------------------------------------------------------------------
-# firewalld
-# ----------------------------------------------------------------------------
-
-if ! command -v firewall-cmd >/dev/null 2>&1; then
-
-    log_info "firewalld is not installed"
-
-    install_package firewalld
-
-    systemctl enable --now firewalld
-
-else
-
-    log_ok "firewalld is installed"
-
-fi
-
-# ----------------------------------------------------------------------------
-# curl
-# ----------------------------------------------------------------------------
-
-if ! command -v curl >/dev/null 2>&1; then
-    install_package curl
-fi
-
-if ! command -v curl >/dev/null 2>&1; then
-    abort "curl is required but could not be installed."
-fi
-
-# ----------------------------------------------------------------------------
-# bgpq4
-# ----------------------------------------------------------------------------
-
-if ! command -v bgpq4 >/dev/null 2>&1; then
-
-    log_info "bgpq4 is not installed"
-
-    install_package bgpq4
-
-fi
-
-if ! command -v bgpq4 >/dev/null 2>&1; then
-
-    abort "bgpq4 is required for ASN prefix generation."
-fi
-
-log_ok "bgpq4 is available"
-
-# ============================================================================
-# Start firewalld
-# ============================================================================
-
-if ! systemctl is-active --quiet firewalld; then
-
-    log_info "Starting firewalld"
-
-    systemctl enable --now firewalld
-
-    if ! systemctl is-active --quiet firewalld; then
-        abort "firewalld could not be started."
-    fi
-
-fi
-
-# ============================================================================
-# Prepare temporary directory
-# ============================================================================
-
-rm -rf "$TMPDIR"
-
-mkdir -p "$TMPDIR"
-
-if [[ ! -d "$TMPDIR" ]]; then
-    abort "Couldn't create ${TMPDIR}"
-fi
-
-# ============================================================================
-# Download GeoIP lists
-# ============================================================================
-
-log_info "Retrieving requested GeoIP zones"
-
-for zone in $ZONES; do
-
-    log_info "Downloading IPv4 zone ${YELLOW}${zone}${NC}"
-
-    IPV4_FILE="$TMPDIR/${zone}-ip4.zone"
-
-    if ! curl \
-        --fail \
-        --silent \
-        --show-error \
-        --location \
-        --connect-timeout 30 \
-        --max-time 120 \
-        -o "$IPV4_FILE" \
-        "https://www.ipdeny.com/ipblocks/data/aggregated/${zone,,}-aggregated.zone"
-    then
-        abort "Failed to download IPv4 zone ${zone}"
-    fi
-
-    if [[ ! -s "$IPV4_FILE" ]]; then
-        abort "Downloaded IPv4 zone ${zone} is empty"
-    fi
-
-    log_ok "IPv4 ${zone} downloaded"
-
-    log_info "Downloading IPv6 zone ${YELLOW}${zone}${NC}"
-
-    IPV6_FILE="$TMPDIR/${zone}-ip6.zone"
-
-    if ! curl \
-        --fail \
-        --silent \
-        --show-error \
-        --location \
-        --connect-timeout 30 \
-        --max-time 120 \
-        -o "$IPV6_FILE" \
-        "https://www.ipdeny.com/ipv6/ipaddresses/aggregated/${zone,,}-aggregated.zone"
-    then
-        abort "Failed to download IPv6 zone ${zone}"
-    fi
-
-    if [[ ! -s "$IPV6_FILE" ]]; then
-        abort "Downloaded IPv6 zone ${zone} is empty"
-    fi
-
-    log_ok "IPv6 ${zone} downloaded"
-
 done
 
-# ============================================================================
-# Download ASN list
-# ============================================================================
+ok "Stale staged ipset cleanup complete."
 
-log_info "Downloading bad ASN list"
 
-ASN_LIST_FILE="$TMPDIR/bad-asns.txt"
+# ===========================================================================
+# Check Firewalld
+# ===========================================================================
 
-if ! curl \
-    --fail \
-    --silent \
-    --show-error \
-    --location \
-    --connect-timeout 30 \
-    --max-time 120 \
-    -o "$ASN_LIST_FILE" \
-    "$ASN_LIST_URL"
-then
-    abort "Failed to download bad ASN list."
-fi
+info "Checking Firewalld ipset support..."
 
-if [[ ! -s "$ASN_LIST_FILE" ]]; then
-    abort "Downloaded ASN list is empty."
-fi
+firewall-cmd --get-ipsets >/dev/null 2>&1 \
+    || fail "Firewalld does not appear to support ipsets."
 
-ASN_COUNT=$(grep -E '^AS[0-9]+' "$ASN_LIST_FILE" | wc -l)
+ok "Firewalld ipsets are supported."
 
-if [[ "$ASN_COUNT" -lt 1 ]]; then
-    abort "No valid ASNs were found in the downloaded ASN list."
-fi
 
-log_ok "Downloaded ${ASN_COUNT} blocked ASNs"
+# ===========================================================================
+# Download GeoIP lists
+# ===========================================================================
 
-# ============================================================================
-# Extract ASN objects
-# ============================================================================
+info "Downloading GeoIP country lists..."
 
-ASN_OBJECTS_FILE="$TMPDIR/asn-objects.txt"
+: > "${COUNTRY_IP4}"
 
-grep -E '^AS[0-9]+' "$ASN_LIST_FILE" \
-    | grep -oE '^AS[0-9]+' \
-    | sort -u \
-    > "$ASN_OBJECTS_FILE"
+for country in ${ZONES}
+do
+    URL="${IPDENY_BASE}/${country}-aggregated.zone"
+    TMP_FILE="${BASE_DIR}/${country}.zone"
 
-ASN_OBJECT_COUNT=$(wc -l < "$ASN_OBJECTS_FILE")
+    info "Downloading ${country} IPv4 ranges..."
 
-if [[ "$ASN_OBJECT_COUNT" -lt 1 ]]; then
-    abort "No ASN objects were extracted."
-fi
+    curl -fsSL \
+        --retry 3 \
+        --connect-timeout 20 \
+        --max-time 300 \
+        "${URL}" \
+        -o "${TMP_FILE}" \
+        || fail "Failed to download ${URL}"
 
-log_ok "Prepared ${ASN_OBJECT_COUNT} unique ASN objects"
+    [[ -s "${TMP_FILE}" ]] \
+        || fail "Downloaded GeoIP file for ${country} is empty."
 
-# ============================================================================
+    cat "${TMP_FILE}" >> "${COUNTRY_IP4}"
+done
+
+ok "GeoIP country lists downloaded."
+
+
+# ===========================================================================
+# Normalize GeoIP IPv4
+# ===========================================================================
+
+info "Normalizing GeoIP IPv4 prefixes..."
+
+python3 - "${COUNTRY_IP4}" "${COUNTRY_IP4}.normalized" <<'PY'
+import ipaddress
+import sys
+
+src = sys.argv[1]
+dst = sys.argv[2]
+
+networks = []
+
+with open(src, "r", encoding="utf-8") as f:
+    for line in f:
+        line = line.strip()
+
+        if not line:
+            continue
+
+        try:
+            net = ipaddress.ip_network(line, strict=False)
+        except ValueError:
+            print(
+                f"Invalid CIDR in GeoIP list: {line}",
+                file=sys.stderr
+            )
+            sys.exit(1)
+
+        if net.version == 4:
+            networks.append(net)
+
+collapsed = list(ipaddress.collapse_addresses(networks))
+
+with open(dst, "w", encoding="utf-8") as f:
+    for net in collapsed:
+        f.write(f"{net}\n")
+
+print(
+    f"Normalized {len(networks)} IPv4 prefixes -> "
+    f"{len(collapsed)} prefixes."
+)
+PY
+
+mv "${COUNTRY_IP4}.normalized" "${COUNTRY_IP4}"
+
+ok "GeoIP IPv4: $(wc -l < "${COUNTRY_IP4}") normalized networks."
+
+
+# ===========================================================================
+# Download bad ASN list
+# ===========================================================================
+
+info "Downloading bad ASN list..."
+
+curl -fsSL \
+    --retry 3 \
+    --connect-timeout 20 \
+    --max-time 300 \
+    "${ASN_LIST_URL}" \
+    -o "${ASN_RAW}" \
+    || fail "Failed to download bad ASN list."
+
+[[ -s "${ASN_RAW}" ]] \
+    || fail "Downloaded ASN list is empty."
+
+ok "Bad ASN list downloaded."
+
+
+# ===========================================================================
+# Parse ASN list
+#
+# Example:
+#
+# AS51167 Contabo GmbH
+#
+# becomes:
+#
+# 51167
+# ===========================================================================
+
+info "Parsing bad ASN list..."
+
+awk '
+{
+    asn = $1
+    sub(/^AS/, "", asn)
+
+    if (asn ~ /^[0-9]+$/)
+        print asn
+}
+' "${ASN_RAW}" \
+    | sort -n -u \
+    > "${ASN_CLEAN}"
+
+ASN_COUNT="$(wc -l < "${ASN_CLEAN}")"
+
+[[ "${ASN_COUNT}" -gt 0 ]] \
+    || fail "No valid ASNs were extracted."
+
+ok "Bad ASN list: ${ASN_COUNT} unique ASNs."
+
+
+# ===========================================================================
+# Build bgpq4 object list
+#
+# bgpq4 accepts multiple AS objects on the same command line and merges
+# their results. This is vastly more efficient than launching bgpq4 once
+# for every ASN.
+# ===========================================================================
+
+info "Preparing ${ASN_COUNT} ASN objects for bgpq4..."
+
+mapfile -t ASN_OBJECTS < <(
+    sed 's/^/AS/' "${ASN_CLEAN}"
+)
+
+[[ "${#ASN_OBJECTS[@]}" -eq "${ASN_COUNT}" ]] \
+    || fail "Failed to prepare ASN objects."
+
+ok "Prepared ${#ASN_OBJECTS[@]} ASN objects."
+
+
+# ===========================================================================
 # Generate ASN IPv4 prefixes
-# ============================================================================
+#
+# ONE bgpq4 invocation instead of ~2,200.
+# ===========================================================================
 
-log_info "Generating IPv4 prefixes from blocked ASNs"
-log_info "This may take some time because bgpq4 is querying IRR routing data."
+info "Generating ASN IPv4 prefixes with bgpq4..."
+info "Querying ${ASN_COUNT} ASNs in a single bgpq4 operation..."
 
-ASN_IP4_FILE="$TMPDIR/asn-ip4.zone"
-
-mapfile -t ASN_OBJECTS < "$ASN_OBJECTS_FILE"
+: > "${ASN_IP4_RAW}"
 
 if ! bgpq4 \
     -4 \
     -A \
-    -F '%n/%l\n' \
+    -F '%n\n' \
     "${ASN_OBJECTS[@]}" \
-    > "$ASN_IP4_FILE"
+    > "${ASN_IP4_RAW}"
 then
-    abort "bgpq4 failed while generating IPv4 ASN prefixes."
+    fail "bgpq4 failed while generating IPv4 prefixes."
 fi
 
-# Remove accidental blank lines.
-sed -i '/^[[:space:]]*$/d' "$ASN_IP4_FILE"
+ok "ASN IPv4 raw prefixes: $(wc -l < "${ASN_IP4_RAW}")"
 
-ASN_IP4_COUNT=$(wc -l < "$ASN_IP4_FILE")
 
-if [[ "$ASN_IP4_COUNT" -lt 1 ]]; then
-    abort "bgpq4 produced no IPv4 prefixes."
-fi
-
-log_ok "Generated ${ASN_IP4_COUNT} IPv4 ASN prefixes"
-
-# ============================================================================
+# ===========================================================================
 # Generate ASN IPv6 prefixes
-# ============================================================================
+#
+# ONE bgpq4 invocation instead of ~2,200.
+# ===========================================================================
 
-log_info "Generating IPv6 prefixes from blocked ASNs"
+info "Generating ASN IPv6 prefixes with bgpq4..."
+info "Querying ${ASN_COUNT} ASNs in a single bgpq4 operation..."
 
-ASN_IP6_FILE="$TMPDIR/asn-ip6.zone"
+: > "${ASN_IP6_RAW}"
 
 if ! bgpq4 \
     -6 \
     -A \
-    -F '%n/%l\n' \
+    -F '%n\n' \
     "${ASN_OBJECTS[@]}" \
-    > "$ASN_IP6_FILE"
+    > "${ASN_IP6_RAW}"
 then
-    abort "bgpq4 failed while generating IPv6 ASN prefixes."
+    fail "bgpq4 failed while generating IPv6 prefixes."
 fi
 
-sed -i '/^[[:space:]]*$/d' "$ASN_IP6_FILE"
+ok "ASN IPv6 raw prefixes: $(wc -l < "${ASN_IP6_RAW}")"
 
-ASN_IP6_COUNT=$(wc -l < "$ASN_IP6_FILE")
 
-if [[ "$ASN_IP6_COUNT" -lt 1 ]]; then
-    abort "bgpq4 produced no IPv6 prefixes."
-fi
+# ===========================================================================
+# Normalize ASN IPv4
+# ===========================================================================
 
-log_ok "Generated ${ASN_IP6_COUNT} IPv6 ASN prefixes"
+info "Normalizing ASN IPv4 prefixes..."
 
-# ============================================================================
-# Validate generated ASN lists
-# ============================================================================
+python3 - "${ASN_IP4_RAW}" "${ASN_IP4_FILE}" <<'PY'
+import ipaddress
+import sys
 
-if ! grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+$' "$ASN_IP4_FILE"; then
-    abort "Generated IPv4 ASN list does not contain valid IPv4 CIDRs."
-fi
+src = sys.argv[1]
+dst = sys.argv[2]
 
-if ! grep -Eq ':' "$ASN_IP6_FILE"; then
-    abort "Generated IPv6 ASN list does not contain valid IPv6 prefixes."
-fi
+networks = []
 
-# ============================================================================
-# Create GeoIP ipsets if required
-# ============================================================================
+with open(src, "r", encoding="utf-8") as f:
+    for line in f:
+        line = line.strip()
 
-create_ipset_if_missing() {
+        if not line:
+            continue
 
-    local name="$1"
-    local family="$2"
+        try:
+            net = ipaddress.ip_network(line, strict=False)
+        except ValueError:
+            print(
+                f"Invalid IPv4 CIDR: {line}",
+                file=sys.stderr
+            )
+            sys.exit(1)
 
-    if firewall-cmd --permanent --get-ipsets \
-        | tr ' ' '\n' \
-        | grep -Fxq "$name"
-    then
+        if net.version == 4:
+            networks.append(net)
 
-        log_ok "ipset ${name} already exists"
+collapsed = list(ipaddress.collapse_addresses(networks))
 
-        return 0
-    fi
+with open(dst, "w", encoding="utf-8") as f:
+    for net in collapsed:
+        f.write(f"{net}\n")
 
-    log_info "Creating ipset ${name}"
-
-    if ! firewall-cmd \
-        --permanent \
-        --new-ipset="$name" \
-        --type=hash:net \
-        --option="family=${family}" \
-        --option="hashsize=${HASHSIZE}" \
-        --option="maxelem=${MAXELEM}"
-    then
-        abort "Couldn't create ipset ${name}"
-    fi
-
-    log_ok "Created ${name}"
-}
-
-create_ipset_if_missing "$GEOIP_BLACKLIST_IP4" "inet"
-create_ipset_if_missing "$GEOIP_BLACKLIST_IP6" "inet6"
-
-# ============================================================================
-# Build new ASN ipsets
-#
-# We use temporary/versioned ipsets so a failed update does not destroy
-# the existing ASN blacklist.
-# ============================================================================
-
-TIMESTAMP="$(date +%Y%m%d%H%M%S)"
-
-NEW_ASN_IP4="${ASN_BLACKLIST_IP4}-${TIMESTAMP}"
-NEW_ASN_IP6="${ASN_BLACKLIST_IP6}-${TIMESTAMP}"
-
-log_info "Creating temporary ASN IPv4 ipset ${NEW_ASN_IP4}"
-
-if ! firewall-cmd \
-    --permanent \
-    --new-ipset="$NEW_ASN_IP4" \
-    --type=hash:net \
-    --option=family=inet \
-    --option="hashsize=${HASHSIZE}" \
-    --option="maxelem=${MAXELEM}"
-then
-    abort "Couldn't create temporary ASN IPv4 ipset."
-fi
-
-log_info "Loading ASN IPv4 prefixes"
-
-if ! firewall-cmd \
-    --permanent \
-    --ipset="$NEW_ASN_IP4" \
-    --add-entries-from-file="$ASN_IP4_FILE"
-then
-    firewall-cmd --permanent --delete-ipset="$NEW_ASN_IP4" >/dev/null 2>&1
-    abort "Couldn't load ASN IPv4 prefixes."
-fi
-
-log_ok "Loaded ASN IPv4 prefixes"
-
-log_info "Creating temporary ASN IPv6 ipset ${NEW_ASN_IP6}"
-
-if ! firewall-cmd \
-    --permanent \
-    --new-ipset="$NEW_ASN_IP6" \
-    --type=hash:net \
-    --option=family=inet6 \
-    --option="hashsize=${HASHSIZE}" \
-    --option="maxelem=${MAXELEM}"
-then
-    firewall-cmd --permanent --delete-ipset="$NEW_ASN_IP4" >/dev/null 2>&1
-    abort "Couldn't create temporary ASN IPv6 ipset."
-fi
-
-log_info "Loading ASN IPv6 prefixes"
-
-if ! firewall-cmd \
-    --permanent \
-    --ipset="$NEW_ASN_IP6" \
-    --add-entries-from-file="$ASN_IP6_FILE"
-then
-    firewall-cmd --permanent --delete-ipset="$NEW_ASN_IP4" >/dev/null 2>&1
-    firewall-cmd --permanent --delete-ipset="$NEW_ASN_IP6" >/dev/null 2>&1
-    abort "Couldn't load ASN IPv6 prefixes."
-fi
-
-log_ok "Loaded ASN IPv6 prefixes"
-
-# ============================================================================
-# Validate temporary ASN ipsets
-# ============================================================================
-
-LOADED_ASN_IP4_COUNT=$(
-    firewall-cmd \
-        --permanent \
-        --ipset="$NEW_ASN_IP4" \
-        --get-entries \
-        | wc -l
+print(
+    f"Normalized {len(networks)} IPv4 prefixes -> "
+    f"{len(collapsed)} prefixes."
 )
+PY
 
-LOADED_ASN_IP6_COUNT=$(
-    firewall-cmd \
-        --permanent \
-        --ipset="$NEW_ASN_IP6" \
-        --get-entries \
-        | wc -l
+ok "ASN IPv4: $(wc -l < "${ASN_IP4_FILE}") normalized networks."
+
+
+# ===========================================================================
+# Normalize ASN IPv6
+# ===========================================================================
+
+info "Normalizing ASN IPv6 prefixes..."
+
+python3 - "${ASN_IP6_RAW}" "${ASN_IP6_FILE}" <<'PY'
+import ipaddress
+import sys
+
+src = sys.argv[1]
+dst = sys.argv[2]
+
+networks = []
+
+with open(src, "r", encoding="utf-8") as f:
+    for line in f:
+        line = line.strip()
+
+        if not line:
+            continue
+
+        try:
+            net = ipaddress.ip_network(line, strict=False)
+        except ValueError:
+            print(
+                f"Invalid IPv6 CIDR: {line}",
+                file=sys.stderr
+            )
+            sys.exit(1)
+
+        if net.version == 6:
+            networks.append(net)
+
+collapsed = list(ipaddress.collapse_addresses(networks))
+
+with open(dst, "w", encoding="utf-8") as f:
+    for net in collapsed:
+        f.write(f"{net}\n")
+
+print(
+    f"Normalized {len(networks)} IPv6 prefixes -> "
+    f"{len(collapsed)} prefixes."
 )
+PY
 
-if [[ "$LOADED_ASN_IP4_COUNT" -lt 1 ]]; then
-    firewall-cmd --permanent --delete-ipset="$NEW_ASN_IP4" >/dev/null 2>&1
-    firewall-cmd --permanent --delete-ipset="$NEW_ASN_IP6" >/dev/null 2>&1
+ok "ASN IPv6: $(wc -l < "${ASN_IP6_FILE}") normalized networks."
 
-    abort "Temporary ASN IPv4 ipset contains no entries."
+
+# ===========================================================================
+# Validate generated CIDRs
+# ===========================================================================
+
+info "Validating generated CIDR lists..."
+
+python3 - \
+    "${COUNTRY_IP4}" \
+    "${ASN_IP4_FILE}" \
+    "${ASN_IP6_FILE}" <<'PY'
+
+import ipaddress
+import sys
+
+for filename in sys.argv[1:]:
+    with open(filename, "r", encoding="utf-8") as f:
+        for line_number, line in enumerate(f, 1):
+            line = line.strip()
+
+            if not line:
+                continue
+
+            try:
+                ipaddress.ip_network(line, strict=False)
+            except ValueError:
+                print(
+                    f"Invalid CIDR in {filename}:{line_number}: {line}",
+                    file=sys.stderr
+                )
+                sys.exit(1)
+
+print("CIDR validation passed.")
+PY
+
+ok "CIDR validation passed."
+
+
+# ===========================================================================
+# Reject default routes
+# ===========================================================================
+
+info "Checking for default routes in ASN lists..."
+
+if grep -Fxq "0.0.0.0/0" "${ASN_IP4_FILE}"; then
+    fail "ASN IPv4 list contains 0.0.0.0/0. Refusing to continue."
 fi
 
-if [[ "$LOADED_ASN_IP6_COUNT" -lt 1 ]]; then
-    firewall-cmd --permanent --delete-ipset="$NEW_ASN_IP4" >/dev/null 2>&1
-    firewall-cmd --permanent --delete-ipset="$NEW_ASN_IP6" >/dev/null 2>&1
-
-    abort "Temporary ASN IPv6 ipset contains no entries."
+if grep -Fxq "::/0" "${ASN_IP6_FILE}"; then
+    fail "ASN IPv6 list contains ::/0. Refusing to continue."
 fi
 
-log_ok "ASN IPv4 ipset contains ${LOADED_ASN_IP4_COUNT} entries"
-log_ok "ASN IPv6 ipset contains ${LOADED_ASN_IP6_COUNT} entries"
+echo "No IPv4/IPv6 default routes found."
 
-# ============================================================================
-# Attach GeoIP sets to drop zone
-# ============================================================================
+ok "No default routes found."
 
-log_info "Ensuring GeoIP ipsets are attached to drop zone"
 
-firewall-cmd \
-    --permanent \
-    --zone=drop \
-    --add-source="ipset:${GEOIP_BLACKLIST_IP4}" \
-    >/dev/null 2>&1 || true
+# ===========================================================================
+# Check ASN lists for overlaps
+# ===========================================================================
 
-firewall-cmd \
-    --permanent \
-    --zone=drop \
-    --add-source="ipset:${GEOIP_BLACKLIST_IP6}" \
-    >/dev/null 2>&1 || true
+info "Checking ASN lists for overlapping networks..."
 
-# ============================================================================
-# Attach new ASN sets BEFORE removing old ones.
-#
-# This means that during an update the firewall can temporarily contain
-# both old and new ASN sets, which is safer than having an empty window.
-# ============================================================================
+python3 - \
+    "${ASN_IP4_FILE}" \
+    "${ASN_IP6_FILE}" <<'PY'
 
-log_info "Attaching new ASN ipsets to drop zone"
+import ipaddress
+import sys
 
-if ! firewall-cmd \
-    --permanent \
-    --zone=drop \
-    --add-source="ipset:${NEW_ASN_IP4}"
+for filename in sys.argv[1:]:
+    networks = []
+
+    with open(filename, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+
+            if not line:
+                continue
+
+            networks.append(
+                ipaddress.ip_network(line, strict=False)
+            )
+
+    networks.sort(
+        key=lambda n: (
+            int(n.network_address),
+            n.prefixlen
+        )
+    )
+
+    previous = None
+
+    for current in networks:
+        if previous is not None and current.subnet_of(previous):
+            print(
+                f"Overlapping networks in {filename}: "
+                f"{previous} contains {current}",
+                file=sys.stderr
+            )
+            sys.exit(1)
+
+        previous = current
+
+print("No overlapping ASN networks found.")
+PY
+
+ok "No overlapping ASN networks found."
+
+
+# ===========================================================================
+# Check Firewalld hash:net support
+# ===========================================================================
+
+info "Checking Firewalld hash:net ipset support..."
+
+TEST_IPSET="firewalld-hash-net-test"
+
+if firewall-cmd --permanent --get-ipsets \
+    | grep -Fxq "${TEST_IPSET}"
 then
-    firewall-cmd --permanent --delete-ipset="$NEW_ASN_IP4" >/dev/null 2>&1
-    firewall-cmd --permanent --delete-ipset="$NEW_ASN_IP6" >/dev/null 2>&1
-
-    abort "Couldn't attach new ASN IPv4 ipset."
+    firewall-cmd --permanent \
+        --delete-ipset="${TEST_IPSET}" \
+        || fail "Could not remove old test ipset."
 fi
 
-if ! firewall-cmd \
-    --permanent \
-    --zone=drop \
-    --add-source="ipset:${NEW_ASN_IP6}"
-then
-    firewall-cmd \
-        --permanent \
-        --zone=drop \
-        --remove-source="ipset:${NEW_ASN_IP4}" \
-        >/dev/null 2>&1
+firewall-cmd --permanent \
+    --new-ipset="${TEST_IPSET}" \
+    --type=hash:net \
+    || fail "Firewalld cannot create hash:net ipsets."
 
-    firewall-cmd --permanent --delete-ipset="$NEW_ASN_IP4" >/dev/null 2>&1
-    firewall-cmd --permanent --delete-ipset="$NEW_ASN_IP6" >/dev/null 2>&1
+firewall-cmd --permanent \
+    --delete-ipset="${TEST_IPSET}" \
+    || fail "Could not remove Firewalld hash:net test ipset."
 
-    abort "Couldn't attach new ASN IPv6 ipset."
-fi
+ok "hash:net ipsets are supported."
 
-# ============================================================================
-# Find existing ASN ipsets
-# ============================================================================
 
-OLD_ASN_IP4=""
-OLD_ASN_IP6=""
+# ===========================================================================
+# Create staged blacklist ipsets
+# ===========================================================================
 
-for existing in $(firewall-cmd --permanent --get-ipsets); do
+info "Creating staged blacklist ipsets..."
 
-    if [[ "$existing" == "${ASN_BLACKLIST_IP4}-"* ]]; then
-        OLD_ASN_IP4="$existing"
+
+# ---------------------------------------------------------------------------
+# GeoIP IPv4
+# ---------------------------------------------------------------------------
+
+info "Creating IPv4 temporary ipset ${NEW_GEOIP_IP4}..."
+
+firewall-cmd --permanent \
+    --new-ipset="${NEW_GEOIP_IP4}" \
+    --type=hash:net \
+    || fail "Failed to create ${NEW_GEOIP_IP4}."
+
+info "Loading IPv4 entries into ${NEW_GEOIP_IP4}..."
+
+while read -r cidr
+do
+    [[ -n "${cidr}" ]] || continue
+
+    firewall-cmd --permanent \
+        --ipset="${NEW_GEOIP_IP4}" \
+        --add-entry="${cidr}" \
+        >/dev/null
+
+done < "${COUNTRY_IP4}"
+
+ok "Staged GeoIP IPv4 loaded."
+
+
+# ---------------------------------------------------------------------------
+# GeoIP IPv6
+# ---------------------------------------------------------------------------
+
+info "Creating IPv6 temporary ipset ${NEW_GEOIP_IP6}..."
+
+firewall-cmd --permanent \
+    --new-ipset="${NEW_GEOIP_IP6}" \
+    --type=hash:net \
+    --family=inet6 \
+    || fail "Failed to create ${NEW_GEOIP_IP6}."
+
+info "${NEW_GEOIP_IP6} has no entries."
+
+ok "Staged GeoIP IPv6 loaded."
+
+
+# ---------------------------------------------------------------------------
+# ASN IPv4
+# ---------------------------------------------------------------------------
+
+info "Creating IPv4 temporary ipset ${NEW_ASN_IP4}..."
+
+firewall-cmd --permanent \
+    --new-ipset="${NEW_ASN_IP4}" \
+    --type=hash:net \
+    || fail "Failed to create ${NEW_ASN_IP4}."
+
+info "Loading IPv4 entries into ${NEW_ASN_IP4}..."
+
+while read -r cidr
+do
+    [[ -n "${cidr}" ]] || continue
+
+    firewall-cmd --permanent \
+        --ipset="${NEW_ASN_IP4}" \
+        --add-entry="${cidr}" \
+        >/dev/null
+
+done < "${ASN_IP4_FILE}"
+
+ok "Staged ASN IPv4 loaded."
+
+
+# ---------------------------------------------------------------------------
+# ASN IPv6
+# ---------------------------------------------------------------------------
+
+info "Creating IPv6 temporary ipset ${NEW_ASN_IP6}..."
+
+firewall-cmd --permanent \
+    --new-ipset="${NEW_ASN_IP6}" \
+    --type=hash:net \
+    --family=inet6 \
+    || fail "Failed to create ${NEW_ASN_IP6}."
+
+info "Loading IPv6 entries into ${NEW_ASN_IP6}..."
+
+while read -r cidr
+do
+    [[ -n "${cidr}" ]] || continue
+
+    firewall-cmd --permanent \
+        --ipset="${NEW_ASN_IP6}" \
+        --add-entry="${cidr}" \
+        >/dev/null
+
+done < "${ASN_IP6_FILE}"
+
+ok "Staged ASN IPv6 loaded."
+
+
+# ===========================================================================
+# Verify staged ipsets in PERMANENT configuration
+# ===========================================================================
+
+info "Verifying staged ipsets in permanent configuration..."
+
+for set in \
+    "${NEW_GEOIP_IP4}" \
+    "${NEW_GEOIP_IP6}" \
+    "${NEW_ASN_IP4}" \
+    "${NEW_ASN_IP6}"
+do
+    if ! firewall-cmd --permanent --get-ipsets \
+        | grep -Fxq "${set}"
+    then
+        fail "Staged ipset ${set} was not created in permanent configuration."
     fi
-
-    if [[ "$existing" == "${ASN_BLACKLIST_IP6}-"* ]]; then
-        OLD_ASN_IP6="$existing"
-    fi
-
 done
 
-# ============================================================================
-# Reload with old + new ASN sets attached.
-# ============================================================================
+ok "All staged ipsets exist in permanent configuration."
 
-log_info "Reloading firewalld with new ASN lists"
 
-if ! firewall-cmd --reload >/dev/null; then
+# ===========================================================================
+# Verify staged entry counts
+# ===========================================================================
 
-    log_error "firewalld reload failed."
+info "Checking staged ipset entry counts..."
 
-    # Remove new sources from permanent configuration.
-    firewall-cmd \
-        --permanent \
-        --zone=drop \
-        --remove-source="ipset:${NEW_ASN_IP4}" \
-        >/dev/null 2>&1 || true
-
-    firewall-cmd \
-        --permanent \
-        --zone=drop \
-        --remove-source="ipset:${NEW_ASN_IP6}" \
-        >/dev/null 2>&1 || true
-
-    firewall-cmd \
-        --permanent \
-        --delete-ipset="$NEW_ASN_IP4" \
-        >/dev/null 2>&1 || true
-
-    firewall-cmd \
-        --permanent \
-        --delete-ipset="$NEW_ASN_IP6" \
-        >/dev/null 2>&1 || true
-
-    abort "ASN update was not activated."
-fi
-
-log_ok "New ASN lists are active"
-
-# ============================================================================
-# Remove old ASN sources
-# ============================================================================
-
-if [[ -n "$OLD_ASN_IP4" && "$OLD_ASN_IP4" != "$NEW_ASN_IP4" ]]; then
-
-    log_info "Removing old ASN IPv4 ipset ${OLD_ASN_IP4}"
-
-    firewall-cmd \
-        --permanent \
-        --zone=drop \
-        --remove-source="ipset:${OLD_ASN_IP4}" \
-        >/dev/null 2>&1 || true
-
-fi
-
-if [[ -n "$OLD_ASN_IP6" && "$OLD_ASN_IP6" != "$NEW_ASN_IP6" ]]; then
-
-    log_info "Removing old ASN IPv6 ipset ${OLD_ASN_IP6}"
-
-    firewall-cmd \
-        --permanent \
-        --zone=drop \
-        --remove-source="ipset:${OLD_ASN_IP6}" \
-        >/dev/null 2>&1 || true
-
-fi
-
-# ============================================================================
-# Reload after removing old sources
-# ============================================================================
-
-log_info "Reloading firewalld"
-
-if ! firewall-cmd --reload >/dev/null; then
-
-    log_warn "Second firewalld reload failed."
-    log_warn "The new ASN lists are still present and the old sources may also remain."
-    log_warn "Run the script again after investigating firewalld."
-
-else
-
-    log_ok "Old ASN sources removed"
-
-fi
-
-# ============================================================================
-# Delete old ASN ipsets
-# ============================================================================
-
-if [[ -n "$OLD_ASN_IP4" && "$OLD_ASN_IP4" != "$NEW_ASN_IP4" ]]; then
-
-    firewall-cmd \
-        --permanent \
-        --delete-ipset="$OLD_ASN_IP4" \
-        >/dev/null 2>&1 || true
-
-fi
-
-if [[ -n "$OLD_ASN_IP6" && "$OLD_ASN_IP6" != "$NEW_ASN_IP6" ]]; then
-
-    firewall-cmd \
-        --permanent \
-        --delete-ipset="$OLD_ASN_IP6" \
-        >/dev/null 2>&1 || true
-
-fi
-
-# ============================================================================
-# Final verification
-# ============================================================================
-
-log_info "Final firewall verification"
-
-firewall-cmd --permanent --zone=drop --list-sources
-
-echo ""
-
-FINAL_GEOIP_IP4_COUNT=$(
-    firewall-cmd \
-        --permanent \
-        --ipset="$GEOIP_BLACKLIST_IP4" \
-        --get-entries \
+for set in \
+    "${NEW_GEOIP_IP4}" \
+    "${NEW_GEOIP_IP6}" \
+    "${NEW_ASN_IP4}" \
+    "${NEW_ASN_IP6}"
+do
+    count="$(
+        firewall-cmd \
+            --permanent \
+            --ipset="${set}" \
+            --get-entries \
+        | sed '/^[[:space:]]*$/d' \
         | wc -l
-)
+    )"
 
-FINAL_GEOIP_IP6_COUNT=$(
-    firewall-cmd \
-        --permanent \
-        --ipset="$GEOIP_BLACKLIST_IP6" \
-        --get-entries \
-        | wc -l
-)
+    info "${set}: ${count} entries"
+done
 
-FINAL_ASN_IP4_COUNT=$(
-    firewall-cmd \
-        --permanent \
-        --ipset="$NEW_ASN_IP4" \
-        --get-entries \
-        | wc -l
-)
+ok "Staged ipset entry checks complete."
 
-FINAL_ASN_IP6_COUNT=$(
-    firewall-cmd \
-        --permanent \
-        --ipset="$NEW_ASN_IP6" \
-        --get-entries \
-        | wc -l
-)
 
-echo -e "[${PURPLE}i${NC}] GeoIP IPv4 ranges:       ${YELLOW}${FINAL_GEOIP_IP4_COUNT}${NC}"
-echo -e "[${PURPLE}i${NC}] GeoIP IPv6 ranges:       ${YELLOW}${FINAL_GEOIP_IP6_COUNT}${NC}"
-echo -e "[${PURPLE}i${NC}] ASN IPv4 ranges:          ${YELLOW}${FINAL_ASN_IP4_COUNT}${NC}"
-echo -e "[${PURPLE}i${NC}] ASN IPv6 ranges:          ${YELLOW}${FINAL_ASN_IP6_COUNT}${NC}"
-echo -e "[${PURPLE}i${NC}] Blocked ASNs processed:   ${YELLOW}${ASN_COUNT}${NC}"
+# ===========================================================================
+# Attach staged ipsets to drop zone
+# ===========================================================================
 
-echo ""
+info "Attaching staged ipsets to ${BLOCK_ZONE}..."
 
-log_ok "Firewall successfully configured with GeoIP + ASN blocking!"
+for set in \
+    "${NEW_GEOIP_IP4}" \
+    "${NEW_GEOIP_IP6}" \
+    "${NEW_ASN_IP4}" \
+    "${NEW_ASN_IP6}"
+do
+    firewall-cmd --permanent \
+        --zone="${BLOCK_ZONE}" \
+        --add-source="ipset:${set}" \
+        || fail "Failed to attach ${set} to ${BLOCK_ZONE}."
+done
+
+ok "All staged ipsets attached to ${BLOCK_ZONE}."
+
+
+# ===========================================================================
+# First reload
+#
+# Existing stable sets remain in place while the staged sets become active.
+# ===========================================================================
+
+info "Reloading Firewalld..."
+
+firewall-cmd --reload \
+    || fail "Firewalld reload failed."
+
+ok "Firewalld reloaded."
+
+
+# ===========================================================================
+# Verify staged ipsets in RUNTIME configuration
+# ===========================================================================
+
+info "Verifying staged ipsets in runtime configuration..."
+
+for set in \
+    "${NEW_GEOIP_IP4}" \
+    "${NEW_GEOIP_IP6}" \
+    "${NEW_ASN_IP4}" \
+    "${NEW_ASN_IP6}"
+do
+    if ! firewall-cmd --get-ipsets \
+        | grep -Fxq "${set}"
+    then
+        fail "Staged ipset ${set} is not active in runtime configuration."
+    fi
+done
+
+ok "All staged ipsets are active at runtime."
+
+
+# ===========================================================================
+# Verify staged zone sources
+# ===========================================================================
+
+info "Verifying staged drop-zone sources..."
+
+for set in \
+    "${NEW_GEOIP_IP4}" \
+    "${NEW_GEOIP_IP6}" \
+    "${NEW_ASN_IP4}" \
+    "${NEW_ASN_IP6}"
+do
+    if ! firewall-cmd --zone="${BLOCK_ZONE}" --list-sources \
+        | tr ' ' '\n' \
+        | grep -Fxq "ipset:${set}"
+    then
+        fail "Staged ipset ${set} is not attached to ${BLOCK_ZONE}."
+    fi
+done
+
+ok "All staged ipsets are attached to ${BLOCK_ZONE} at runtime."
+
+
+# ===========================================================================
+# Remove old stable zone sources
+# ===========================================================================
+
+info "Removing old stable blacklist sources..."
+
+for set in \
+    "${GEOIP_IP4}" \
+    "${GEOIP_IP6}" \
+    "${ASN_IP4}" \
+    "${ASN_IP6}"
+do
+    if firewall-cmd --permanent --zone="${BLOCK_ZONE}" --list-sources \
+        | tr ' ' '\n' \
+        | grep -Fxq "ipset:${set}"
+    then
+        firewall-cmd --permanent \
+            --zone="${BLOCK_ZONE}" \
+            --remove-source="ipset:${set}" \
+            || fail "Failed to remove old source ipset:${set}."
+    fi
+done
+
+ok "Old stable blacklist sources removed."
+
+
+# ===========================================================================
+# Remove old stable ipsets
+# ===========================================================================
+
+info "Removing old stable ipsets..."
+
+for set in \
+    "${GEOIP_IP4}" \
+    "${GEOIP_IP6}" \
+    "${ASN_IP4}" \
+    "${ASN_IP6}"
+do
+    if firewall-cmd --permanent --get-ipsets \
+        | grep -Fxq "${set}"
+    then
+        firewall-cmd --permanent \
+            --delete-ipset="${set}" \
+            || fail "Failed to remove old ipset ${set}."
+
+        if firewall-cmd --permanent --get-ipsets \
+            | grep -Fxq "${set}"
+        then
+            fail "Old ipset ${set} still exists after deletion."
+        fi
+    fi
+done
+
+ok "Old stable ipsets removed."
+
+
+# ===========================================================================
+# Rename staged ipsets to stable names
+# ===========================================================================
+
+info "Renaming staged ipsets to stable names..."
+
+firewall-cmd --permanent \
+    --rename-ipset="${NEW_GEOIP_IP4}" \
+    --newname="${GEOIP_IP4}" \
+    || fail "Failed to rename ${NEW_GEOIP_IP4}."
+
+firewall-cmd --permanent \
+    --rename-ipset="${NEW_GEOIP_IP6}" \
+    --newname="${GEOIP_IP6}" \
+    || fail "Failed to rename ${NEW_GEOIP_IP6}."
+
+firewall-cmd --permanent \
+    --rename-ipset="${NEW_ASN_IP4}" \
+    --newname="${ASN_IP4}" \
+    || fail "Failed to rename ${NEW_ASN_IP4}."
+
+firewall-cmd --permanent \
+    --rename-ipset="${NEW_ASN_IP6}" \
+    --newname="${ASN_IP6}" \
+    || fail "Failed to rename ${NEW_ASN_IP6}."
+
+ok "Staged ipsets renamed to stable names."
+
+
+# ===========================================================================
+# Attach stable ipsets
+# ===========================================================================
+
+info "Attaching stable blacklist ipsets to ${BLOCK_ZONE}..."
+
+for set in \
+    "${GEOIP_IP4}" \
+    "${GEOIP_IP6}" \
+    "${ASN_IP4}" \
+    "${ASN_IP6}"
+do
+    firewall-cmd --permanent \
+        --zone="${BLOCK_ZONE}" \
+        --add-source="ipset:${set}" \
+        || fail "Failed to attach ${set} to ${BLOCK_ZONE}."
+done
+
+ok "Stable blacklist ipsets attached."
+
+
+# ===========================================================================
+# Final reload
+# ===========================================================================
+
+info "Performing final Firewalld reload..."
+
+firewall-cmd --reload \
+    || fail "Final Firewalld reload failed."
+
+ok "Final Firewalld reload complete."
+
+
+# ===========================================================================
+# Final runtime verification
+# ===========================================================================
+
+info "Performing final runtime verification..."
+
+for set in \
+    "${GEOIP_IP4}" \
+    "${GEOIP_IP6}" \
+    "${ASN_IP4}" \
+    "${ASN_IP6}"
+do
+    if ! firewall-cmd --get-ipsets \
+        | grep -Fxq "${set}"
+    then
+        fail "Final runtime ipset ${set} is missing."
+    fi
+done
+
+ok "All stable ipsets are active at runtime."
+
+
+# ===========================================================================
+# Final zone verification
+# ===========================================================================
+
+info "Verifying final ${BLOCK_ZONE} zone sources..."
+
+for set in \
+    "${GEOIP_IP4}" \
+    "${GEOIP_IP6}" \
+    "${ASN_IP4}" \
+    "${ASN_IP6}"
+do
+    if ! firewall-cmd --zone="${BLOCK_ZONE}" --list-sources \
+        | tr ' ' '\n' \
+        | grep -Fxq "ipset:${set}"
+    then
+        fail "Final ipset ${set} is not attached to ${BLOCK_ZONE}."
+    fi
+done
+
+ok "All blacklist ipsets are attached to ${BLOCK_ZONE}."
+
+
+# ===========================================================================
+# Final permanent verification
+# ===========================================================================
+
+info "Verifying final permanent configuration..."
+
+for set in \
+    "${GEOIP_IP4}" \
+    "${GEOIP_IP6}" \
+    "${ASN_IP4}" \
+    "${ASN_IP6}"
+do
+    if ! firewall-cmd --permanent --get-ipsets \
+        | grep -Fxq "${set}"
+    then
+        fail "Final permanent ipset ${set} is missing."
+    fi
+done
+
+ok "Final permanent ipset configuration verified."
+
+
+# ===========================================================================
+# Final summary
+# ===========================================================================
+
+echo
+echo "============================================================"
+echo " Firewalld blacklist update complete"
+echo "============================================================"
+echo
+echo "GeoIP IPv4 : ${GEOIP_IP4}"
+echo "GeoIP IPv6 : ${GEOIP_IP6}"
+echo "ASN IPv4   : ${ASN_IP4}"
+echo "ASN IPv6   : ${ASN_IP6}"
+echo
+
+echo "GeoIP IPv4 entries:"
+firewall-cmd --ipset="${GEOIP_IP4}" --get-entries | wc -l
+
+echo "GeoIP IPv6 entries:"
+firewall-cmd --ipset="${GEOIP_IP6}" --get-entries | wc -l
+
+echo "ASN IPv4 entries:"
+firewall-cmd --ipset="${ASN_IP4}" --get-entries | wc -l
+
+echo "ASN IPv6 entries:"
+firewall-cmd --ipset="${ASN_IP6}" --get-entries | wc -l
+
+echo
+echo "Drop zone sources:"
+firewall-cmd --zone="${BLOCK_ZONE}" --list-sources
+
+echo
+echo "============================================================"
