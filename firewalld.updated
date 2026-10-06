@@ -13,15 +13,15 @@ set -Eeuo pipefail
 #
 # Data:
 #   GeoIP IPv4 : IPdeny aggregated country lists
-#   GeoIP IPv6 : existing stable IPv6 list is preserved
+#   GeoIP IPv6 : IPdeny aggregated IPv6 country lists
 #   Bad ASNs   : bountyyfi bad-asn-list
 #   ASN routes : bgpq4 / IRR
 #
-# Strategy:
+# Strat:
 #   - Generate everything in temporary/staged ipsets.
 #   - Validate before touching stable configuration.
 #   - Activate staged sets first.
-#   - Build stable sets from the validated files.
+#   - Size hash:net ipsets dynamically from validated entry counts.
 #   - Activate stable sets.
 #   - Remove staged sets only after stable sets are verified.
 #
@@ -35,13 +35,19 @@ set -Eeuo pipefail
 # Configuration
 ############################
 
-ZONES="ch cn cl uy"
+ZONES="ru cn"
+
+# Deduplicate country codes while preserving their configured order.
+ZONES=$(printf '%s\n' ${ZONES} | awk '!seen[$0]++' | tr '\n' ' ' | sed 's/[[:space:]]*$//')
+
+[[ -n "${ZONES}" ]] || die "No GeoIP countries configured."
 
 ZONE="drop"
 
 WORK_DIR="/var/lib/firewalld-geoip"
 
-IPDENY_BASE="https://www.ipdeny.com/ipblocks/data/aggregated"
+IPDENY_IP4_BASE="https://www.ipdeny.com/ipblocks/data/aggregated"
+IPDENY_IP6_BASE="https://www.ipdeny.com/ipv6/ipaddresses/aggregated"
 
 ASN_LIST_URL="https://raw.githubusercontent.com/bountyyfi/bad-asn-list/refs/heads/main/all.txt"
 
@@ -49,6 +55,7 @@ ASN_LIST="${WORK_DIR}/bad-asn.txt"
 ASN_LIST_CLEAN="${ASN_LIST}.clean"
 
 GEOIP_RAW="${WORK_DIR}/geoip-ip4.raw"
+GEOIP_IP6_RAW="${WORK_DIR}/geoip-ip6.raw"
 GEOIP_IP4_FILE="${WORK_DIR}/geoip-ip4.txt"
 GEOIP_IP6_FILE="${WORK_DIR}/geoip-ip6.txt"
 
@@ -102,6 +109,26 @@ die()
 {
     error "$*"
     exit 1
+}
+
+############################
+# Calculate ipset maxelem
+############################
+
+calculate_maxelem()
+{
+    local count="$1"
+    local target
+    local maxelem=65536
+
+    # Keep 25% headroom above the current entry count.
+    target=$(( count + count / 4 ))
+
+    while (( maxelem < target )); do
+        maxelem=$(( maxelem * 2 ))
+    done
+
+    echo "${maxelem}"
 }
 
 ############################
@@ -311,10 +338,11 @@ success "Firewalld ipsets are supported."
 info "Downloading GeoIP country lists..."
 
 : > "${GEOIP_RAW}"
+: > "${GEOIP_IP6_RAW}"
 
 for country in ${ZONES}; do
 
-    url="${IPDENY_BASE}/${country}-aggregated.zone"
+    url="${IPDENY_IP4_BASE}/${country}-aggregated.zone"
     output="${WORK_DIR}/${country}-aggregated.zone"
 
     info "Downloading ${country} IPv4 ranges..."
@@ -330,16 +358,39 @@ for country in ${ZONES}; do
         --max-time 120 \
         "${url}" \
         --output "${output}" \
-        || die "Failed to download ${country} GeoIP list."
+        || die "Failed to download ${country} IPv4 GeoIP list."
 
     [[ -s "${output}" ]] \
-        || die "Downloaded ${country} GeoIP list is empty."
+        || die "Downloaded ${country} IPv4 GeoIP list is empty."
 
     cat "${output}" >> "${GEOIP_RAW}"
 
+    url="${IPDENY_IP6_BASE}/${country}-aggregated.zone"
+    output="${WORK_DIR}/${country}-aggregated-ipv6.zone"
+
+    info "Downloading ${country} IPv6 ranges..."
+
+    curl \
+        --fail \
+        --silent \
+        --show-error \
+        --location \
+        --retry 3 \
+        --retry-delay 2 \
+        --connect-timeout 15 \
+        --max-time 120 \
+        "${url}" \
+        --output "${output}" \
+        || die "Failed to download ${country} IPv6 GeoIP list."
+
+    [[ -s "${output}" ]] \
+        || die "Downloaded ${country} IPv6 GeoIP list is empty."
+
+    cat "${output}" >> "${GEOIP_IP6_RAW}"
+
 done
 
-success "GeoIP country lists downloaded."
+success "GeoIP IPv4 and IPv6 country lists downloaded."
 
 ############################
 # Normalize GeoIP IPv4
@@ -357,28 +408,20 @@ dst = sys.argv[2]
 networks = []
 
 with open(src, "r", encoding="utf-8") as f:
-
     for line in f:
-
         value = line.strip()
-
         if not value:
             continue
-
         try:
             net = ipaddress.ip_network(value, strict=False)
         except ValueError:
-            raise SystemExit(
-                f"Invalid CIDR in {src}: {value}"
-            )
-
+            raise SystemExit(f"Invalid CIDR in {src}: {value}")
         if net.version == 4:
             networks.append(net)
 
 collapsed = list(ipaddress.collapse_addresses(networks))
 
 with open(dst, "w", encoding="utf-8") as f:
-
     for net in collapsed:
         f.write(f"{net}\n")
 
@@ -396,54 +439,56 @@ GEOIP_COUNT=$(wc -l < "${GEOIP_IP4_FILE}")
 success "GeoIP IPv4: ${GEOIP_COUNT} normalized networks."
 
 ############################
-# Preserve existing GeoIP IPv6
+# Normalize GeoIP IPv6
 ############################
 
-info "Preparing GeoIP IPv6 list..."
+info "Normalizing GeoIP IPv6 prefixes..."
 
-: > "${GEOIP_IP6_FILE}"
+python3 - "${GEOIP_IP6_RAW}" "${GEOIP_IP6_FILE}" <<'PY'
+import ipaddress
+import sys
 
-if ipset_exists_permanent "${GEOIP_IP6}"; then
+src = sys.argv[1]
+dst = sys.argv[2]
 
-    firewall-cmd \
-        --permanent \
-        --ipset="${GEOIP_IP6}" \
-        --get-entries \
-        | tr ' ' '\n' \
-        | sed '/^[[:space:]]*$/d' \
-        > "${GEOIP_IP6_FILE}"
+networks = []
 
-    GEOIP_IP6_COUNT=$(wc -l < "${GEOIP_IP6_FILE}")
+with open(src, "r", encoding="utf-8") as f:
+    for line in f:
+        value = line.strip()
+        if not value:
+            continue
+        try:
+            net = ipaddress.ip_network(value, strict=False)
+        except ValueError:
+            raise SystemExit(f"Invalid CIDR in {src}: {value}")
+        if net.version == 6:
+            networks.append(net)
 
-    info "Preserving existing GeoIP IPv6 blacklist: ${GEOIP_IP6_COUNT} entries."
+collapsed = list(ipaddress.collapse_addresses(networks))
 
-else
+with open(dst, "w", encoding="utf-8") as f:
+    for net in collapsed:
+        f.write(f"{net}\n")
 
-    # This also handles the state left by the failed previous run:
-    # the old stable GeoIP IPv6 set may already have been removed.
-    #
-    # If the working copy from the previous run exists, use that.
-    if [[ -s "${WORK_DIR}/geoip-ip6.txt" ]]; then
-
-        info "Using existing working GeoIP IPv6 list."
-
-    else
-
-        GEOIP_IP6_COUNT=0
-
-        info "No existing GeoIP IPv6 blacklist found; staged IPv6 list will be empty."
-
-    fi
-
-fi
+print(
+    f"Normalized {len(networks)} IPv6 prefixes -> "
+    f"{len(collapsed)} prefixes."
+)
+PY
 
 GEOIP_IP6_COUNT=$(wc -l < "${GEOIP_IP6_FILE}")
+
+[[ "${GEOIP_IP6_COUNT}" -gt 0 ]] \
+    || die "Normalized GeoIP IPv6 list is empty."
+
+success "GeoIP IPv6: ${GEOIP_IP6_COUNT} normalized networks."
 
 ############################
 # Download bad ASN list
 ############################
 
-info "Downloading bad ASN list..."
+
 
 curl \
     --fail \
@@ -697,6 +742,25 @@ ASN_IP6_COUNT=$(wc -l < "${ASN_IP6_FILE}")
 
 success "ASN IPv6: ${ASN_IP6_COUNT} normalized networks."
 
+############################
+# Calculate ipset capacities
+############################
+
+info "Calculating ipset capacities..."
+
+GEOIP_IP4_MAXELEM=$(calculate_maxelem "${GEOIP_COUNT}")
+GEOIP_IP6_MAXELEM=$(calculate_maxelem "${GEOIP_IP6_COUNT}")
+ASN_IP4_MAXELEM=$(calculate_maxelem "${ASN_IP4_COUNT}")
+ASN_IP6_MAXELEM=$(calculate_maxelem "${ASN_IP6_COUNT}")
+
+echo
+echo "      Calculated ipset capacities:"
+echo "      GeoIP IPv4 : ${GEOIP_COUNT} entries -> maxelem ${GEOIP_IP4_MAXELEM}"
+echo "      GeoIP IPv6 : ${GEOIP_IP6_COUNT} entries -> maxelem ${GEOIP_IP6_MAXELEM}"
+echo "      ASN IPv4   : ${ASN_IP4_COUNT} entries -> maxelem ${ASN_IP4_MAXELEM}"
+echo "      ASN IPv6   : ${ASN_IP6_COUNT} entries -> maxelem ${ASN_IP6_MAXELEM}"
+echo
+
 ###############################################################################
 # VALIDATION
 ###############################################################################
@@ -900,6 +964,7 @@ firewall-cmd \
     --permanent \
     --new-ipset="${NEW_GEOIP_IP4}" \
     --type=hash:net \
+    --option="maxelem=${GEOIP_IP4_MAXELEM}" \
     >/dev/null
 
 info "Loading IPv4 entries into ${NEW_GEOIP_IP4}..."
@@ -923,6 +988,7 @@ firewall-cmd \
     --new-ipset="${NEW_GEOIP_IP6}" \
     --type=hash:net \
     --family=inet6 \
+    --option="maxelem=${GEOIP_IP6_MAXELEM}" \
     >/dev/null
 
 if [[ -s "${GEOIP_IP6_FILE}" ]]; then
@@ -955,6 +1021,7 @@ firewall-cmd \
     --permanent \
     --new-ipset="${NEW_ASN_IP4}" \
     --type=hash:net \
+    --option="maxelem=${ASN_IP4_MAXELEM}" \
     >/dev/null
 
 info "Loading IPv4 entries into ${NEW_ASN_IP4}..."
@@ -978,6 +1045,7 @@ firewall-cmd \
     --new-ipset="${NEW_ASN_IP6}" \
     --type=hash:net \
     --family=inet6 \
+    --option="maxelem=${ASN_IP6_MAXELEM}" \
     >/dev/null
 
 info "Loading IPv6 entries into ${NEW_ASN_IP6}..."
@@ -1212,6 +1280,7 @@ firewall-cmd \
     --permanent \
     --new-ipset="${GEOIP_IP4}" \
     --type=hash:net \
+    --option="maxelem=${GEOIP_IP4_MAXELEM}" \
     >/dev/null
 
 info "Loading ${GEOIP_IP4}..."
@@ -1233,6 +1302,7 @@ firewall-cmd \
     --new-ipset="${GEOIP_IP6}" \
     --type=hash:net \
     --family=inet6 \
+    --option="maxelem=${GEOIP_IP6_MAXELEM}" \
     >/dev/null
 
 if [[ -s "${GEOIP_IP6_FILE}" ]]; then
@@ -1257,6 +1327,7 @@ firewall-cmd \
     --permanent \
     --new-ipset="${ASN_IP4}" \
     --type=hash:net \
+    --option="maxelem=${ASN_IP4_MAXELEM}" \
     >/dev/null
 
 info "Loading ${ASN_IP4}..."
@@ -1278,6 +1349,7 @@ firewall-cmd \
     --new-ipset="${ASN_IP6}" \
     --type=hash:net \
     --family=inet6 \
+    --option="maxelem=${ASN_IP6_MAXELEM}" \
     >/dev/null
 
 info "Loading ${ASN_IP6}..."
