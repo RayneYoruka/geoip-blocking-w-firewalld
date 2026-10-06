@@ -1,0 +1,434 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+###############################################################################
+# firewalld GeoIP + Bad ASN + optional X4B blacklist updater
+###############################################################################
+
+# Sources are independently configurable:
+#   ENABLE_GEOIP          - IPdeny country lists
+#   ENABLE_ASN            - bountyyfi bad ASN list + bgpq4/IRR
+#   ENABLE_X4B_VPN        - X4B VPN lists
+#   ENABLE_X4B_DATACENTER - X4B datacenter lists
+#
+# Each enabled source gets independent IPv4/IPv6 ipsets. Disabled sources are
+# removed from the permanent/runtime firewall if they existed from an earlier run.
+# All enabled sets are staged, validated, sized dynamically, activated, verified,
+# then promoted to stable names. firewalld has no --rename-ipset.
+###############################################################################
+
+############################
+# Configuration
+############################
+
+ZONES="ru cn de fr"
+ENABLE_GEOIP="true"
+ENABLE_ASN="true"
+ENABLE_X4B_VPN="true"
+ENABLE_X4B_DATACENTER="true"
+ZONE="drop"
+WORK_DIR="/var/lib/firewalld-geoip"
+
+IPDENY_IP4_BASE="https://www.ipdeny.com/ipblocks/data/aggregated"
+IPDENY_IP6_BASE="https://www.ipdeny.com/ipv6/ipaddresses/aggregated"
+ASN_LIST_URL="https://raw.githubusercontent.com/bountyyfi/bad-asn-list/refs/heads/main/all.txt"
+X4B_VPN_IP4_URL="https://raw.githubusercontent.com/X4BNet/lists_vpn/refs/heads/main/output/vpn/ipv4.txt"
+X4B_VPN_IP6_URL="https://raw.githubusercontent.com/X4BNet/lists_vpn/refs/heads/main/output/vpn/ipv6.txt"
+X4B_DATACENTER_IP4_URL="https://raw.githubusercontent.com/X4BNet/lists_vpn/refs/heads/main/output/datacenter/ipv4.txt"
+X4B_DATACENTER_IP6_URL="https://raw.githubusercontent.com/X4BNet/lists_vpn/refs/heads/main/output/datacenter/ipv6.txt"
+
+# Deduplicate countries while preserving order.
+ZONES=$(printf '%s\n' ${ZONES} | awk '!seen[$0]++' | tr '\n' ' ' | sed 's/[[:space:]]*$//')
+[[ "${ENABLE_GEOIP}" != "true" || -n "${ZONES}" ]] || { echo "[✗] GeoIP enabled but no countries configured." >&2; exit 1; }
+
+############################
+# Names
+############################
+
+GEOIP_IP4="geoip-blacklist-ip4"; GEOIP_IP6="geoip-blacklist-ip6"
+ASN_IP4="asn-blacklist-ip4"; ASN_IP6="asn-blacklist-ip6"
+X4B_VPN_IP4="x4b-vpn-ip4"; X4B_VPN_IP6="x4b-vpn-ip6"
+X4B_DATACENTER_IP4="x4b-datacenter-ip4"; X4B_DATACENTER_IP6="x4b-datacenter-ip6"
+
+NEW_GEOIP_IP4="${GEOIP_IP4}-new"; NEW_GEOIP_IP6="${GEOIP_IP6}-new"
+NEW_ASN_IP4="${ASN_IP4}-new"; NEW_ASN_IP6="${ASN_IP6}-new"
+NEW_X4B_VPN_IP4="${X4B_VPN_IP4}-new"; NEW_X4B_VPN_IP6="${X4B_VPN_IP6}-new"
+NEW_X4B_DATACENTER_IP4="${X4B_DATACENTER_IP4}-new"; NEW_X4B_DATACENTER_IP6="${X4B_DATACENTER_IP6}-new"
+
+GEOIP_RAW="${WORK_DIR}/geoip-ip4.raw"; GEOIP_IP6_RAW="${WORK_DIR}/geoip-ip6.raw"
+GEOIP_IP4_FILE="${WORK_DIR}/geoip-ip4.txt"; GEOIP_IP6_FILE="${WORK_DIR}/geoip-ip6.txt"
+ASN_LIST="${WORK_DIR}/bad-asn.txt"; ASN_LIST_CLEAN="${ASN_LIST}.clean"; ASN_OBJECTS="${WORK_DIR}/asn-objects.txt"
+ASN_IP4_RAW="${WORK_DIR}/asn-ip4.raw"; ASN_IP6_RAW="${WORK_DIR}/asn-ip6.raw"
+ASN_IP4_FILE="${WORK_DIR}/asn-ip4.txt"; ASN_IP6_FILE="${WORK_DIR}/asn-ip6.txt"
+X4B_VPN_IP4_FILE="${WORK_DIR}/x4b-vpn-ip4.txt"; X4B_VPN_IP6_FILE="${WORK_DIR}/x4b-vpn-ip6.txt"
+X4B_DATACENTER_IP4_FILE="${WORK_DIR}/x4b-datacenter-ip4.txt"; X4B_DATACENTER_IP6_FILE="${WORK_DIR}/x4b-datacenter-ip6.txt"
+
+info(){ echo "[i] $*"; }
+success(){ echo "[✓] $*"; }
+die(){ echo "[✗] $*" >&2; exit 1; }
+
+ipset_exists_permanent(){ firewall-cmd --permanent --get-ipsets 2>/dev/null | tr -s '[:space:]' '\n' | grep -Fxq "$1"; }
+ipset_exists_runtime(){ firewall-cmd --get-ipsets 2>/dev/null | tr -s '[:space:]' '\n' | grep -Fxq "$1"; }
+zone_source_exists_permanent(){ firewall-cmd --permanent --zone="${ZONE}" --list-sources 2>/dev/null | tr -s '[:space:]' '\n' | grep -Fxq "ipset:$1"; }
+zone_source_exists_runtime(){ firewall-cmd --zone="${ZONE}" --list-sources 2>/dev/null | tr -s '[:space:]' '\n' | grep -Fxq "ipset:$1"; }
+remove_permanent_source(){ zone_source_exists_permanent "$1" && firewall-cmd --permanent --zone="${ZONE}" --remove-source="ipset:$1" >/dev/null || true; }
+remove_permanent_ipset(){ ipset_exists_permanent "$1" && firewall-cmd --permanent --delete-ipset="$1" >/dev/null || true; }
+calculate_maxelem(){
+    local count="$1"
+    local target
+    local maxelem=65536
+
+    target=$((count + count / 4))
+
+    while ((maxelem < target)); do
+        maxelem=$((maxelem * 2))
+    done
+
+    echo "$maxelem"
+}
+
+###############################################################################
+# Initial checks
+###############################################################################
+
+[[ "$EUID" -eq 0 ]] || die "This script must be run as root."
+for command in firewall-cmd curl python3; do command -v "$command" >/dev/null 2>&1 || die "Required command not found: $command"; done
+if [[ "$ENABLE_ASN" == "true" ]]; then command -v bgpq4 >/dev/null 2>&1 || die "Required command not found: bgpq4"; fi
+mkdir -p "$WORK_DIR"
+
+if [[ "$ENABLE_GEOIP" != "true" ]]; then
+    ZONES=""
+fi
+
+info "Configuration:"
+echo "      Countries          : ${ZONES:-<none>}"
+echo "      Zone               : ${ZONE}"
+echo "      GeoIP              : ${ENABLE_GEOIP}"
+echo "      Bad ASN            : ${ENABLE_ASN}"
+echo "      X4B VPN            : ${ENABLE_X4B_VPN}"
+echo "      X4B Datacenter     : ${ENABLE_X4B_DATACENTER}"
+
+###############################################################################
+# Remove stale staged sets from any previous run
+###############################################################################
+
+info "Cleaning stale staged ipsets..."
+for set in "$NEW_GEOIP_IP4" "$NEW_GEOIP_IP6" "$NEW_ASN_IP4" "$NEW_ASN_IP6" "$NEW_X4B_VPN_IP4" "$NEW_X4B_VPN_IP6" "$NEW_X4B_DATACENTER_IP4" "$NEW_X4B_DATACENTER_IP6"; do
+    remove_permanent_source "$set"
+    remove_permanent_ipset "$set"
+done
+success "Stale staged ipset cleanup complete."
+
+###############################################################################
+# Generate source lists
+###############################################################################
+
+if [[ "$ENABLE_GEOIP" == "true" ]]; then
+    info "Downloading GeoIP country lists..."
+    : > "$GEOIP_RAW"; : > "$GEOIP_IP6_RAW"
+    for country in ${ZONES}; do
+        curl --fail --silent --show-error --location --retry 3 --retry-delay 2 --connect-timeout 15 --max-time 120 \
+            "${IPDENY_IP4_BASE}/${country}-aggregated.zone" --output "${WORK_DIR}/${country}-aggregated.zone" \
+            || die "Failed to download ${country} IPv4 GeoIP list."
+        [[ -s "${WORK_DIR}/${country}-aggregated.zone" ]] || die "Downloaded ${country} IPv4 GeoIP list is empty."
+        cat "${WORK_DIR}/${country}-aggregated.zone" >> "$GEOIP_RAW"
+        curl --fail --silent --show-error --location --retry 3 --retry-delay 2 --connect-timeout 15 --max-time 120 \
+            "${IPDENY_IP6_BASE}/${country}-aggregated.zone" --output "${WORK_DIR}/${country}-aggregated-ipv6.zone" \
+            || die "Failed to download ${country} IPv6 GeoIP list."
+        [[ -s "${WORK_DIR}/${country}-aggregated-ipv6.zone" ]] || die "Downloaded ${country} IPv6 GeoIP list is empty."
+        cat "${WORK_DIR}/${country}-aggregated-ipv6.zone" >> "$GEOIP_IP6_RAW"
+    done
+
+    python3 - "$GEOIP_RAW" "$GEOIP_IP4_FILE" 4 <<'PY'
+import ipaddress,sys
+src,dst,fam=sys.argv[1],sys.argv[2],int(sys.argv[3]); nets=[]
+with open(src,encoding='utf-8') as f:
+    for n,line in enumerate(f,1):
+        v=line.strip()
+        if not v: continue
+        try: net=ipaddress.ip_network(v,strict=False)
+        except ValueError: raise SystemExit(f"Invalid CIDR in {src}:{n}: {v}")
+        if net.version==fam: nets.append(net)
+nets=list(ipaddress.collapse_addresses(nets))
+with open(dst,'w',encoding='utf-8') as f:
+    for net in nets: f.write(f'{net}\n')
+print(f'Normalized {len(nets)} IPv4 prefixes -> {dst}')
+PY
+    python3 - "$GEOIP_IP6_RAW" "$GEOIP_IP6_FILE" 6 <<'PY'
+import ipaddress,sys
+src,dst,fam=sys.argv[1],sys.argv[2],int(sys.argv[3]); nets=[]
+with open(src,encoding='utf-8') as f:
+    for n,line in enumerate(f,1):
+        v=line.strip()
+        if not v: continue
+        try: net=ipaddress.ip_network(v,strict=False)
+        except ValueError: raise SystemExit(f"Invalid CIDR in {src}:{n}: {v}")
+        if net.version==fam: nets.append(net)
+nets=list(ipaddress.collapse_addresses(nets))
+with open(dst,'w',encoding='utf-8') as f:
+    for net in nets: f.write(f'{net}\n')
+print(f'Normalized {len(nets)} IPv6 prefixes -> {dst}')
+PY
+    GEOIP_COUNT=$(wc -l < "$GEOIP_IP4_FILE"); GEOIP_IP6_COUNT=$(wc -l < "$GEOIP_IP6_FILE")
+    ((GEOIP_COUNT>0)) || die "Normalized GeoIP IPv4 list is empty."
+    ((GEOIP_IP6_COUNT>0)) || die "Normalized GeoIP IPv6 list is empty."
+else
+    rm -f "$GEOIP_IP4_FILE" "$GEOIP_IP6_FILE"
+    GEOIP_COUNT=0; GEOIP_IP6_COUNT=0
+fi
+
+if [[ "$ENABLE_ASN" == "true" ]]; then
+    info "Downloading bad ASN list..."
+    curl --fail --silent --show-error --location --retry 3 --retry-delay 2 --connect-timeout 15 --max-time 120 \
+        "$ASN_LIST_URL" --output "$ASN_LIST" || die "Failed to download bad ASN list."
+    [[ -s "$ASN_LIST" ]] || die "Downloaded bad ASN list is empty."
+    awk '{asn=$1; sub(/^AS/,"",asn); if(asn ~ /^[0-9]+$/) print asn}' "$ASN_LIST" | sort -n -u > "$ASN_LIST_CLEAN"
+    ASN_COUNT=$(wc -l < "$ASN_LIST_CLEAN"); ((ASN_COUNT>0)) || die "No valid ASNs were found."
+    awk '{print "AS" $1}' "$ASN_LIST_CLEAN" > "$ASN_OBJECTS"
+
+    info "Generating ASN IPv4 prefixes with bgpq4..."
+    bgpq4 -4 -F '%n/%l\n' $(cat "$ASN_OBJECTS") > "$ASN_IP4_RAW" || die "bgpq4 IPv4 query failed."
+    info "Generating ASN IPv6 prefixes with bgpq4..."
+    bgpq4 -6 -F '%n/%l\n' $(cat "$ASN_OBJECTS") > "$ASN_IP6_RAW" || die "bgpq4 IPv6 query failed."
+    [[ -s "$ASN_IP4_RAW" ]] || die "bgpq4 returned no IPv4 prefixes."
+    [[ -s "$ASN_IP6_RAW" ]] || die "bgpq4 returned no IPv6 prefixes."
+    python3 - "$ASN_IP4_RAW" "$ASN_IP4_FILE" 4 <<'PY'
+import ipaddress,sys
+src,dst,fam=sys.argv[1],sys.argv[2],int(sys.argv[3]); nets=[]
+with open(src,encoding='utf-8') as f:
+    for n,line in enumerate(f,1):
+        v=line.strip()
+        if not v: continue
+        try: net=ipaddress.ip_network(v,strict=False)
+        except ValueError: raise SystemExit(f"Invalid bgpq4 output in {src}:{n}: {v}")
+        if net.version!=fam: raise SystemExit(f"Wrong address family in {src}:{n}: {v}")
+        nets.append(net)
+nets=list(ipaddress.collapse_addresses(nets))
+with open(dst,'w',encoding='utf-8') as f:
+    for net in nets: f.write(f'{net}\n')
+print(f'Normalized {len(nets)} IPv4 ASN prefixes.')
+PY
+    python3 - "$ASN_IP6_RAW" "$ASN_IP6_FILE" 6 <<'PY'
+import ipaddress,sys
+src,dst,fam=sys.argv[1],sys.argv[2],int(sys.argv[3]); nets=[]
+with open(src,encoding='utf-8') as f:
+    for n,line in enumerate(f,1):
+        v=line.strip()
+        if not v: continue
+        try: net=ipaddress.ip_network(v,strict=False)
+        except ValueError: raise SystemExit(f"Invalid bgpq4 output in {src}:{n}: {v}")
+        if net.version!=fam: raise SystemExit(f"Wrong address family in {src}:{n}: {v}")
+        nets.append(net)
+nets=list(ipaddress.collapse_addresses(nets))
+with open(dst,'w',encoding='utf-8') as f:
+    for net in nets: f.write(f'{net}\n')
+print(f'Normalized {len(nets)} IPv6 ASN prefixes.')
+PY
+    ASN_IP4_COUNT=$(wc -l < "$ASN_IP4_FILE"); ASN_IP6_COUNT=$(wc -l < "$ASN_IP6_FILE")
+    ((ASN_IP4_COUNT>0)) || die "Normalized ASN IPv4 list is empty."
+    ((ASN_IP6_COUNT>0)) || die "Normalized ASN IPv6 list is empty."
+else
+    rm -f "$ASN_IP4_FILE" "$ASN_IP6_FILE"
+    ASN_IP4_COUNT=0; ASN_IP6_COUNT=0
+fi
+
+download_x4b(){
+    local enabled="$1" label="$2" url="$3" file="$4" family="$5"
+    [[ "$enabled" == "true" ]] || { rm -f "$file"; return; }
+    info "Downloading ${label}..."
+    curl --fail --silent --show-error --location --retry 3 --retry-delay 2 --connect-timeout 15 --max-time 120 "$url" --output "$file" || die "Failed to download ${label}."
+    [[ -s "$file" ]] || die "Downloaded ${label} is empty."
+    python3 - "$file" "$family" <<'PY'
+import ipaddress,sys
+fn,fam=sys.argv[1],int(sys.argv[2]); nets=[]
+with open(fn,encoding='utf-8') as f:
+    for n,line in enumerate(f,1):
+        v=line.strip()
+        if not v: continue
+        try: net=ipaddress.ip_network(v,strict=False)
+        except ValueError: raise SystemExit(f"Invalid CIDR in {fn}:{n}: {v}")
+        if net.version!=fam: raise SystemExit(f"Wrong address family in {fn}:{n}: {v}")
+        nets.append(net)
+nets=list(ipaddress.collapse_addresses(nets))
+with open(fn,'w',encoding='utf-8') as f:
+    for net in nets: f.write(f'{net}\n')
+print(f'Normalized {len(nets)} X4B prefixes: {fn}')
+PY
+}
+download_x4b "$ENABLE_X4B_VPN" "X4B VPN IPv4" "$X4B_VPN_IP4_URL" "$X4B_VPN_IP4_FILE" 4
+download_x4b "$ENABLE_X4B_VPN" "X4B VPN IPv6" "$X4B_VPN_IP6_URL" "$X4B_VPN_IP6_FILE" 6
+download_x4b "$ENABLE_X4B_DATACENTER" "X4B Datacenter IPv4" "$X4B_DATACENTER_IP4_URL" "$X4B_DATACENTER_IP4_FILE" 4
+download_x4b "$ENABLE_X4B_DATACENTER" "X4B Datacenter IPv6" "$X4B_DATACENTER_IP6_URL" "$X4B_DATACENTER_IP6_FILE" 6
+
+count_file(){ [[ -s "$1" ]] && wc -l < "$1" || echo 0; }
+X4B_VPN_IP4_COUNT=$(count_file "$X4B_VPN_IP4_FILE"); X4B_VPN_IP6_COUNT=$(count_file "$X4B_VPN_IP6_FILE")
+X4B_DATACENTER_IP4_COUNT=$(count_file "$X4B_DATACENTER_IP4_FILE"); X4B_DATACENTER_IP6_COUNT=$(count_file "$X4B_DATACENTER_IP6_FILE")
+
+###############################################################################
+# Validation
+###############################################################################
+
+FILES=()
+[[ "$ENABLE_GEOIP" == "true" ]] && FILES+=("$GEOIP_IP4_FILE" "$GEOIP_IP6_FILE")
+[[ "$ENABLE_ASN" == "true" ]] && FILES+=("$ASN_IP4_FILE" "$ASN_IP6_FILE")
+[[ "$ENABLE_X4B_VPN" == "true" ]] && FILES+=("$X4B_VPN_IP4_FILE" "$X4B_VPN_IP6_FILE")
+[[ "$ENABLE_X4B_DATACENTER" == "true" ]] && FILES+=("$X4B_DATACENTER_IP4_FILE" "$X4B_DATACENTER_IP6_FILE")
+python3 - "${FILES[@]}" <<'PY'
+import ipaddress,sys
+for fn in sys.argv[1:]:
+    with open(fn,encoding='utf-8') as f:
+        for n,line in enumerate(f,1):
+            v=line.strip()
+            if not v: continue
+            net=ipaddress.ip_network(v,strict=False)
+            if net.prefixlen==0: raise SystemExit(f'Default route found in {fn}:{n}: {net}')
+print('CIDR/default-route validation passed.')
+PY
+if [[ "$ENABLE_ASN" == "true" ]]; then
+    python3 - "$ASN_IP4_FILE" "$ASN_IP6_FILE" <<'PY'
+import ipaddress,sys
+for fn in sys.argv[1:]:
+    nets=[ipaddress.ip_network(x.strip(),strict=False) for x in open(fn,encoding='utf-8') if x.strip()]
+    nets.sort(key=lambda n:(int(n.network_address),n.prefixlen))
+    prev=None
+    for net in nets:
+        if prev is not None and net.overlaps(prev): raise SystemExit(f'Overlapping ASN networks in {fn}: {prev} overlaps {net}')
+        prev=net
+print('No overlapping ASN networks found.')
+PY
+fi
+
+###############################################################################
+# Capacities
+###############################################################################
+
+GEOIP_IP4_MAXELEM=$(calculate_maxelem "$GEOIP_COUNT"); GEOIP_IP6_MAXELEM=$(calculate_maxelem "$GEOIP_IP6_COUNT")
+ASN_IP4_MAXELEM=$(calculate_maxelem "$ASN_IP4_COUNT"); ASN_IP6_MAXELEM=$(calculate_maxelem "$ASN_IP6_COUNT")
+X4B_VPN_IP4_MAXELEM=$(calculate_maxelem "$X4B_VPN_IP4_COUNT"); X4B_VPN_IP6_MAXELEM=$(calculate_maxelem "$X4B_VPN_IP6_COUNT")
+X4B_DATACENTER_IP4_MAXELEM=$(calculate_maxelem "$X4B_DATACENTER_IP4_COUNT"); X4B_DATACENTER_IP6_MAXELEM=$(calculate_maxelem "$X4B_DATACENTER_IP6_COUNT")
+
+echo; info "Calculated capacities:";
+[[ "$ENABLE_GEOIP" == true ]] && echo "  GeoIP IPv4        : $GEOIP_COUNT -> maxelem $GEOIP_IP4_MAXELEM" && echo "  GeoIP IPv6        : $GEOIP_IP6_COUNT -> maxelem $GEOIP_IP6_MAXELEM"
+[[ "$ENABLE_ASN" == true ]] && echo "  ASN IPv4          : $ASN_IP4_COUNT -> maxelem $ASN_IP4_MAXELEM" && echo "  ASN IPv6          : $ASN_IP6_COUNT -> maxelem $ASN_IP6_MAXELEM"
+[[ "$ENABLE_X4B_VPN" == true ]] && echo "  X4B VPN IPv4      : $X4B_VPN_IP4_COUNT -> maxelem $X4B_VPN_IP4_MAXELEM" && echo "  X4B VPN IPv6      : $X4B_VPN_IP6_COUNT -> maxelem $X4B_VPN_IP6_MAXELEM"
+[[ "$ENABLE_X4B_DATACENTER" == true ]] && echo "  X4B DC IPv4       : $X4B_DATACENTER_IP4_COUNT -> maxelem $X4B_DATACENTER_IP4_MAXELEM" && echo "  X4B DC IPv6       : $X4B_DATACENTER_IP6_COUNT -> maxelem $X4B_DATACENTER_IP6_MAXELEM"
+
+###############################################################################
+# Source table
+###############################################################################
+
+S_NAMES=("GeoIP IPv4" "GeoIP IPv6" "Bad ASN IPv4" "Bad ASN IPv6" "X4B VPN IPv4" "X4B VPN IPv6" "X4B Datacenter IPv4" "X4B Datacenter IPv6")
+S_STABLE=("$GEOIP_IP4" "$GEOIP_IP6" "$ASN_IP4" "$ASN_IP6" "$X4B_VPN_IP4" "$X4B_VPN_IP6" "$X4B_DATACENTER_IP4" "$X4B_DATACENTER_IP6")
+S_NEW=("$NEW_GEOIP_IP4" "$NEW_GEOIP_IP6" "$NEW_ASN_IP4" "$NEW_ASN_IP6" "$NEW_X4B_VPN_IP4" "$NEW_X4B_VPN_IP6" "$NEW_X4B_DATACENTER_IP4" "$NEW_X4B_DATACENTER_IP6")
+S_FILE=("$GEOIP_IP4_FILE" "$GEOIP_IP6_FILE" "$ASN_IP4_FILE" "$ASN_IP6_FILE" "$X4B_VPN_IP4_FILE" "$X4B_VPN_IP6_FILE" "$X4B_DATACENTER_IP4_FILE" "$X4B_DATACENTER_IP6_FILE")
+S_FAM=(4 6 4 6 4 6 4 6)
+S_MAX=("$GEOIP_IP4_MAXELEM" "$GEOIP_IP6_MAXELEM" "$ASN_IP4_MAXELEM" "$ASN_IP6_MAXELEM" "$X4B_VPN_IP4_MAXELEM" "$X4B_VPN_IP6_MAXELEM" "$X4B_DATACENTER_IP4_MAXELEM" "$X4B_DATACENTER_IP6_MAXELEM")
+S_ON=("$ENABLE_GEOIP" "$ENABLE_GEOIP" "$ENABLE_ASN" "$ENABLE_ASN" "$ENABLE_X4B_VPN" "$ENABLE_X4B_VPN" "$ENABLE_X4B_DATACENTER" "$ENABLE_X4B_DATACENTER")
+
+###############################################################################
+# Firewalld staging / promotion
+###############################################################################
+
+firewall-cmd --get-ipset-types | tr ' ' '\n' | grep -Fxq hash:net || die "Firewalld does not support hash:net ipsets."
+
+create_set(){
+    local name="$1" fam="$2" max="$3"
+    if [[ "$fam" == 6 ]]; then
+        firewall-cmd --permanent --new-ipset="$name" --type=hash:net --family=inet6 --option="maxelem=$max" >/dev/null
+    else
+        firewall-cmd --permanent --new-ipset="$name" --type=hash:net --option="maxelem=$max" >/dev/null
+    fi
+}
+verify_set(){
+    local name="$1" file="$2" expected actual
+    ipset_exists_permanent "$name" || die "Missing ipset: $name"
+    expected=$(grep -cve '^[[:space:]]*$' "$file" || true)
+    actual=$(firewall-cmd --permanent --ipset="$name" --get-entries | tr ' ' '\n' | sed '/^[[:space:]]*$/d' | wc -l)
+    [[ "$expected" -eq "$actual" ]] || die "Entry count mismatch for $name: expected $expected, got $actual"
+}
+
+info "Creating staged blacklist ipsets..."
+for i in "${!S_NAMES[@]}"; do
+    [[ "${S_ON[$i]}" == true ]] || continue
+    create_set "${S_NEW[$i]}" "${S_FAM[$i]}" "${S_MAX[$i]}"
+    [[ -s "${S_FILE[$i]}" ]] && firewall-cmd --permanent --ipset="${S_NEW[$i]}" --add-entries-from-file="${S_FILE[$i]}" >/dev/null
+    verify_set "${S_NEW[$i]}" "${S_FILE[$i]}"
+    firewall-cmd --permanent --zone="$ZONE" --add-source="ipset:${S_NEW[$i]}" >/dev/null
+ done
+firewall-cmd --reload >/dev/null
+
+for i in "${!S_NAMES[@]}"; do
+    [[ "${S_ON[$i]}" == true ]] || continue
+    ipset_exists_runtime "${S_NEW[$i]}" || die "Staged runtime ipset missing: ${S_NEW[$i]}"
+    zone_source_exists_runtime "${S_NEW[$i]}" || die "Staged runtime source missing: ${S_NEW[$i]}"
+done
+
+info "Promoting staged data into stable ipsets..."
+for i in "${!S_NAMES[@]}"; do
+    stable="${S_STABLE[$i]}"; new="${S_NEW[$i]}"
+    if [[ "${S_ON[$i]}" == true ]]; then
+        remove_permanent_source "$stable"
+        remove_permanent_ipset "$stable"
+        create_set "$stable" "${S_FAM[$i]}" "${S_MAX[$i]}"
+        [[ -s "${S_FILE[$i]}" ]] && firewall-cmd --permanent --ipset="$stable" --add-entries-from-file="${S_FILE[$i]}" >/dev/null
+        verify_set "$stable" "${S_FILE[$i]}"
+        firewall-cmd --permanent --zone="$ZONE" --add-source="ipset:$stable" >/dev/null
+    else
+        # Disabled sources are explicitly removed.
+        remove_permanent_source "$stable"
+        remove_permanent_ipset "$stable"
+    fi
+done
+
+firewall-cmd --reload >/dev/null
+for i in "${!S_NAMES[@]}"; do
+    if [[ "${S_ON[$i]}" == true ]]; then
+        ipset_exists_runtime "${S_STABLE[$i]}" || die "Stable runtime ipset missing: ${S_STABLE[$i]}"
+        zone_source_exists_runtime "${S_STABLE[$i]}" || die "Stable runtime source missing: ${S_STABLE[$i]}"
+    else
+        ipset_exists_runtime "${S_STABLE[$i]}" && die "Disabled ipset still active: ${S_STABLE[$i]}"
+        zone_source_exists_runtime "${S_STABLE[$i]}" && die "Disabled source still active: ${S_STABLE[$i]}"
+    fi
+done
+
+info "Removing staged ipsets..."
+for i in "${!S_NAMES[@]}"; do
+    remove_permanent_source "${S_NEW[$i]}"
+    remove_permanent_ipset "${S_NEW[$i]}"
+done
+firewall-cmd --reload >/dev/null
+
+for i in "${!S_NAMES[@]}"; do
+    ipset_exists_runtime "${S_NEW[$i]}" && die "Staged runtime ipset remains: ${S_NEW[$i]}"
+    ipset_exists_permanent "${S_NEW[$i]}" && die "Staged permanent ipset remains: ${S_NEW[$i]}"
+done
+
+###############################################################################
+# Final report
+###############################################################################
+
+echo
+echo "[i] Final ${ZONE} sources:"
+firewall-cmd --zone="$ZONE" --list-sources
+echo
+echo "[i] Final runtime ipsets:"
+firewall-cmd --get-ipsets
+echo
+echo "============================================================"
+echo " Update completed successfully"
+echo "============================================================"
+echo
+echo " Countries          : ${ZONES:-<none>}"
+echo " GeoIP              : ${ENABLE_GEOIP}"
+echo " Bad ASN            : ${ENABLE_ASN}"
+echo " X4B VPN            : ${ENABLE_X4B_VPN}"
+echo " X4B Datacenter     : ${ENABLE_X4B_DATACENTER}"
+echo " Zone               : ${ZONE}"
+echo
+echo " Prefix counts:"
+[[ "$ENABLE_GEOIP" == true ]] && echo " GeoIP IPv4        : $GEOIP_COUNT" && echo " GeoIP IPv6        : $GEOIP_IP6_COUNT"
+[[ "$ENABLE_ASN" == true ]] && echo " ASN IPv4          : $ASN_IP4_COUNT" && echo " ASN IPv6          : $ASN_IP6_COUNT"
+[[ "$ENABLE_X4B_VPN" == true ]] && echo " X4B VPN IPv4      : $X4B_VPN_IP4_COUNT" && echo " X4B VPN IPv6      : $X4B_VPN_IP6_COUNT"
+[[ "$ENABLE_X4B_DATACENTER" == true ]] && echo " X4B DC IPv4       : $X4B_DATACENTER_IP4_COUNT" && echo " X4B DC IPv6       : $X4B_DATACENTER_IP6_COUNT"
+echo
+echo "============================================================"
